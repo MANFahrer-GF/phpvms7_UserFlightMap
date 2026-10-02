@@ -9,6 +9,7 @@ use App\Models\Pirep;
 use App\Models\User;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 
 class ProfileMapController extends Controller
@@ -89,5 +90,111 @@ class ProfileMapController extends Controller
                 'routes'          => count($lines),
             ],
         ]);
+    }
+
+    /**
+     * Volanta-style history: every accepted flight of the pilot with its real
+     * ACARS track (thinned to ~90 points) or, for flights without positions,
+     * just the endpoints (the frontend draws a great-circle fallback).
+     */
+    public function tracks(Request $request, int $id): JsonResponse
+    {
+        $user = User::findOrFail($id);
+
+        $flights = DB::table('pireps as p')
+            ->leftJoin('airports as d', 'd.id', '=', 'p.dpt_airport_id')
+            ->leftJoin('airports as a', 'a.id', '=', 'p.arr_airport_id')
+            ->leftJoin('aircraft as ac', 'ac.id', '=', 'p.aircraft_id')
+            ->where('p.user_id', $user->id)
+            ->where('p.state', PirepState::ACCEPTED)
+            ->whereNull('p.deleted_at')
+            ->orderByDesc('p.submitted_at')
+            ->get([
+                'p.id', 'p.submitted_at', 'p.created_at', 'p.flight_time', 'p.distance', 'p.landing_rate',
+                'd.icao as dpt', 'd.lat as dlat', 'd.lon as dlon', 'd.name as dname',
+                'a.icao as arr', 'a.lat as alat', 'a.lon as alon', 'a.name as aname',
+                'ac.icao as type', 'ac.registration as reg',
+            ]);
+
+        // GSG runs with CACHE_DRIVER=null, so use the file store explicitly. A finished
+        // flight's track never changes -> cache the thinned track per flight (forever).
+        $store = Cache::store('file');
+        $ids = $flights->pluck('id')->all();
+        $keyOf = fn ($id) => 'ufm.t1.'.$id;
+        $got = $store->many(array_map($keyOf, $ids));
+        $tracks = [];
+        $missing = [];
+        foreach ($ids as $id) {
+            $v = $got[$keyOf($id)] ?? null;
+            if ($v === null) {
+                $missing[] = $id;
+            } elseif ($v !== 0) {
+                $tracks[$id] = $v;
+            }
+        }
+
+        if ($missing) {
+            $counts = DB::table('acars')->where('type', 0)->whereIn('pirep_id', $missing)
+                ->select('pirep_id', DB::raw('COUNT(*) as c'))->groupBy('pirep_id')->pluck('c', 'pirep_id');
+            $step = [];
+            foreach ($counts as $pid => $c) {
+                $step[$pid] = max(1, (int) floor($c / 70));
+            }
+
+            $new = [];
+            $seen = [];
+            $last = [];
+            $rows = DB::table('acars')->where('type', 0)->whereIn('pirep_id', array_keys($step))
+                ->whereNotNull('lat')->whereNotNull('lon')
+                ->orderBy('pirep_id')->orderBy('created_at')->orderBy('id')
+                ->select('pirep_id', 'lat', 'lon')->cursor();
+            foreach ($rows as $r) {
+                $n = $seen[$r->pirep_id] = ($seen[$r->pirep_id] ?? 0) + 1;
+                $pt = [round((float) $r->lat, 3), round((float) $r->lon, 3)];
+                $last[$r->pirep_id] = $pt;
+                if (($n - 1) % $step[$r->pirep_id] === 0) {
+                    $new[$r->pirep_id][] = $pt;
+                }
+            }
+            foreach ($last as $pid => $pt) {
+                if (end($new[$pid]) !== $pt) {
+                    $new[$pid][] = $pt;
+                }
+            }
+            foreach ($missing as $id) {
+                $t = $new[$id] ?? null;
+                $store->forever($keyOf($id), $t ?: 0);
+                if ($t) {
+                    $tracks[$id] = $t;
+                }
+            }
+        }
+
+        $list = [];
+        foreach ($flights as $f) {
+            if ($f->dlat === null || $f->alat === null) {
+                continue;
+            }
+            $t = $tracks[$f->id] ?? null;
+            $dist = $f->distance;
+            if (is_string($dist) && str_starts_with($dist, '{')) {
+                $dist = json_decode($dist, true)['nmi'] ?? null;
+            }
+            $list[] = [
+                'id'    => $f->id,
+                'date'  => substr((string) ($f->submitted_at ?: $f->created_at), 0, 10),
+                'dpt'   => $f->dpt, 'arr' => $f->arr,
+                'dname' => $f->dname, 'aname' => $f->aname,
+                'from'  => [(float) $f->dlat, (float) $f->dlon],
+                'to'    => [(float) $f->alat, (float) $f->alon],
+                'type'  => $f->type, 'reg' => $f->reg,
+                'min'   => (int) $f->flight_time,
+                'nm'    => $dist !== null ? (int) round((float) $dist) : null,
+                'lr'    => $f->landing_rate !== null ? (int) round((float) $f->landing_rate) : null,
+                'track' => ($t && count($t) > 4) ? $t : null,
+            ];
+        }
+
+        return response()->json(['flights' => $list]);
     }
 }
