@@ -1,0 +1,16 @@
+{
+    "name": "UserFlightMap",
+    "alias": "userflightmap",
+    "version": "1.0.0",
+    "description": "Profil-Reiter Flugkarte: besuchte und noch offene Flughaefen des Streckennetzes je Pilot.",
+    "keywords": ["phpvms", "map", "profile", "airports", "gsg"],
+    "active": 1,
+    "order": 0,
+    "providers": [
+        "Modules\\UserFlightMap\\Providers\\AppServiceProvider",
+        "Modules\\UserFlightMap\\Providers\\RouteServiceProvider"
+    ],
+    "aliases": {},
+    "files": [],
+    "requires": []
+}
